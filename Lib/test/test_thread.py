@@ -253,6 +253,57 @@ class TestForkInThread(unittest.TestCase):
         self.assertIsNotNone(pid)
         support.wait_process(pid, exitcode=0)
 
+    @unittest.skipUnless(hasattr(os, 'fork'), 'need os.fork')
+    @threading_helper.reap_threads
+    def test_stdio_at_fork_reinit(self):
+
+        import sys
+        num_prints = 100
+        num_forks = 100
+
+        def printer_thread(stdio):
+            for n in range(num_prints):
+                stdio.write('t')
+                stdio.flush()
+
+        def fork_processes(stdio):
+            pids = []
+            for n in range(num_forks):
+                if pid := os.fork():
+                    pids.append(pid)
+                else:
+                    stdio.write('p')
+                    stdio.flush()
+                    os._exit(0)
+
+            return pids
+
+        def main(stdio):
+            thread.start_new_thread(printer_thread, (stdio,))
+            pids = fork_processes(stdio)
+
+            # bpo-46210: Added _PySys_ReInitStdio to prevent children
+            # from deadlocking here if printer_thread held the stdout
+            # buffer's lock when one of the children forked.
+            import time
+            from collections import deque
+            pids = deque(pids)
+            timeout = 5
+            start = time.time()
+            while pids:
+                pid = pids.popleft()
+                wpid, wsts = os.waitpid(pid, os.WNOHANG)
+                if (wpid, wsts) == (0, 0):
+                    pids.append(pid)
+                if time.time() - start > timeout:
+                    break
+
+            if pids:
+                raise AssertionError(f"Deadlocked processes: {pids}")
+
+        for stdio in (sys.stdout, sys.stderr):
+            main(stdio)
+
     def tearDown(self):
         try:
             os.close(self.read_fd)
