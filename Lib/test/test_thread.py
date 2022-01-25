@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import unittest
@@ -266,46 +267,56 @@ class TestForkInThread(unittest.TestCase):
             pass
 
 
-import _io
 class TestStdioAtForkReInit(unittest.TestCase):
 
+    class MockStdIO(io.TextIOWrapper):
+        def __init__(self):
+            import _io, tempfile
+            self._file = tempfile.mktemp()
+            raw = _io.FileIO(self._file, mode='wb')
+            buffer = _io.BufferedWriter(raw)
+            super().__init__(buffer)
+
+        def __del__(self):
+            try:
+                self.close()
+                os.remove(self._file)
+            except:
+                pass
+
+        def isatty(self):
+            # pretend to be a tty, so _PySys_ReInitStdio
+            # will attempt to reinitialize our buffer lock.
+            return True
+
     def setUp(self):
+        # Replace stdout & stderr with mock objects with the
+        # same underlying buffer type to avoid polluting the
+        # test output stream.
         self._saved_stdout = sys.stdout
         self._saved_stderr = sys.stderr
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+        sys.stdout = self.MockStdIO()
+        sys.stderr = self.MockStdIO()
 
     def tearDown(self):
         sys.stdout = self._saved_stdout
         sys.stderr = self._saved_stderr
 
     @unittest.skipUnless(hasattr(os, 'fork'), 'need os.fork')
+    @threading_helper.reap_threads
     def test_stdio_at_fork_reinit(self):
 
         # bpo-46210: Added _PySys_ReInitStdio to prevent children
         # from deadlocking here if printer_thread held the stdout
-        # buffer's lock when one of the children forked.
-        #
-        # The bug in question can be triggered by a simple print().
-        #
-        # The complications here involving print's 'file' and 'end'
-        # keywords, as well as the use of a unicode zero-width space,
-        # are not related to the bug in question. They're included
-        # here only in order to solve the problem of (1) preventing
-        # the test output from being polluted by printed strings, while
-        # (2) actually printing *something* of nonzero length to both
-        # stdout and stderr. We can't simply redirect the print to a
-        # dummy object by replacing sys.stdout and sys.stderr, since
-        # it's a deadlock involving those objects that this test needs
-        # to assert does not occur.
+        # (or stderr) buffer's lock when one of the children forked.
 
         num_prints = 100
         num_forks = 100
-        msg = '\u200b'*10   # see above for explanation.
+        msg = 'hello'*10
 
         def printer_thread(stdio):
             for n in range(num_prints):
-                print(msg, file=stdio, end='')
+                print(msg, file=stdio)
                 stdio.flush()
 
         def fork_processes(stdio):
@@ -314,7 +325,7 @@ class TestStdioAtForkReInit(unittest.TestCase):
                 if pid := os.fork():
                     pids.append(pid)
                 else:
-                    print(msg, file=stdio, end='')
+                    print(msg, file=stdio)
                     stdio.flush()
                     os._exit(0)
 
@@ -330,8 +341,16 @@ class TestStdioAtForkReInit(unittest.TestCase):
         # tests
         for stdio in (sys.stdout, sys.stderr):
             with threading_helper.wait_threads_exit():
-                main(stdio)
-
+                # Forking here is not necessary to illustrate the bug
+                # in bpo-46210 (and its fix). We fork here only to
+                # allow us to give a single timeout to the main() call,
+                # since its 'failure' mode (absent the fix) is to deadlock,
+                # rather than to raise an exception.
+                if main_pid := os.fork():
+                    support.wait_process(main_pid, exitcode=0, timeout=5)
+                else:
+                    main(stdio)
+                    os._exit(0)
 
 if __name__ == "__main__":
     unittest.main()
