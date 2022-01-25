@@ -1,4 +1,5 @@
 import os
+import sys
 import unittest
 import random
 from test import support
@@ -253,57 +254,6 @@ class TestForkInThread(unittest.TestCase):
         self.assertIsNotNone(pid)
         support.wait_process(pid, exitcode=0)
 
-    @unittest.skipUnless(hasattr(os, 'fork'), 'need os.fork')
-    @threading_helper.reap_threads
-    def test_stdio_at_fork_reinit(self):
-
-        import sys
-        num_prints = 100
-        num_forks = 100
-
-        def printer_thread(stdio):
-            for n in range(num_prints):
-                stdio.write('t')
-                stdio.flush()
-
-        def fork_processes(stdio):
-            pids = []
-            for n in range(num_forks):
-                if pid := os.fork():
-                    pids.append(pid)
-                else:
-                    stdio.write('p')
-                    stdio.flush()
-                    os._exit(0)
-
-            return pids
-
-        def main(stdio):
-            thread.start_new_thread(printer_thread, (stdio,))
-            pids = fork_processes(stdio)
-
-            # bpo-46210: Added _PySys_ReInitStdio to prevent children
-            # from deadlocking here if printer_thread held the stdout
-            # buffer's lock when one of the children forked.
-            import time
-            from collections import deque
-            pids = deque(pids)
-            timeout = 5
-            start = time.time()
-            while pids:
-                pid = pids.popleft()
-                wpid, wsts = os.waitpid(pid, os.WNOHANG)
-                if (wpid, wsts) == (0, 0):
-                    pids.append(pid)
-                if time.time() - start > timeout:
-                    break
-
-            if pids:
-                raise AssertionError(f"Deadlocked processes: {pids}")
-
-        for stdio in (sys.stdout, sys.stderr):
-            main(stdio)
-
     def tearDown(self):
         try:
             os.close(self.read_fd)
@@ -314,6 +264,73 @@ class TestForkInThread(unittest.TestCase):
             os.close(self.write_fd)
         except OSError:
             pass
+
+
+import _io
+class TestStdioAtForkReInit(unittest.TestCase):
+
+    def setUp(self):
+        self._saved_stdout = sys.stdout
+        self._saved_stderr = sys.stderr
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+
+    def tearDown(self):
+        sys.stdout = self._saved_stdout
+        sys.stderr = self._saved_stderr
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'need os.fork')
+    def test_stdio_at_fork_reinit(self):
+
+        # bpo-46210: Added _PySys_ReInitStdio to prevent children
+        # from deadlocking here if printer_thread held the stdout
+        # buffer's lock when one of the children forked.
+        #
+        # The bug in question can be triggered by a simple print().
+        #
+        # The complications here involving print's 'file' and 'end'
+        # keywords, as well as the use of a unicode zero-width space,
+        # are not related to the bug in question. They're included
+        # here only in order to solve the problem of (1) preventing
+        # the test output from being polluted by printed strings, while
+        # (2) actually printing *something* of nonzero length to both
+        # stdout and stderr. We can't simply redirect the print to a
+        # dummy object by replacing sys.stdout and sys.stderr, since
+        # it's a deadlock involving those objects that this test needs
+        # to assert does not occur.
+
+        num_prints = 100
+        num_forks = 100
+        msg = '\u200b'*10   # see above for explanation.
+
+        def printer_thread(stdio):
+            for n in range(num_prints):
+                print(msg, file=stdio, end='')
+                stdio.flush()
+
+        def fork_processes(stdio):
+            pids = []
+            for n in range(num_forks):
+                if pid := os.fork():
+                    pids.append(pid)
+                else:
+                    print(msg, file=stdio, end='')
+                    stdio.flush()
+                    os._exit(0)
+
+            return pids
+
+        def main(stdio):
+            thread.start_new_thread(printer_thread, (stdio,))
+            pids = fork_processes(stdio)
+            for pid in pids:
+                support.wait_process(pid, exitcode=0)
+            return
+
+        # tests
+        for stdio in (sys.stdout, sys.stderr):
+            with threading_helper.wait_threads_exit():
+                main(stdio)
 
 
 if __name__ == "__main__":
