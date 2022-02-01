@@ -269,7 +269,7 @@ class TestForkInThread(unittest.TestCase):
 
 class TestStdioAtForkReInit(unittest.TestCase):
 
-    class MockStdIO(io.TextIOWrapper):
+    class MockStdio(io.TextIOWrapper):
         def __init__(self):
             import _io, tempfile
             self._file = tempfile.mktemp()
@@ -295,8 +295,8 @@ class TestStdioAtForkReInit(unittest.TestCase):
         # test output stream.
         self._saved_stdout = sys.stdout
         self._saved_stderr = sys.stderr
-        sys.stdout = self.MockStdIO()
-        sys.stderr = self.MockStdIO()
+        sys.stdout = self.MockStdio()
+        sys.stderr = self.MockStdio()
 
     def tearDown(self):
         sys.stdout = self._saved_stdout
@@ -338,14 +338,31 @@ class TestStdioAtForkReInit(unittest.TestCase):
                 support.wait_process(pid, exitcode=0)
             return
 
-        # tests
+        # Forking below is not necessary to illustrate the bug
+        # in bpo-46210 and its fix. The issue in bpo-46210 is
+        # that calling main(sys.stdout) or main(sys.stderr)
+        # is sufficient to cause a deadlock in print. We fork
+        # here only to allow us to give a single timeout to the
+        # main() call, since its failure mode (absent the fix)
+        # is for some subset of the forked child processes to
+        # deadlock at the moment when they try to print, rather
+        # than to raise an exception. Therefore, simply looping
+        # over the child pids and calling support.wait_process
+        # with a separate nonzero timeout for each child leads
+        # to a rather unpredictable total wait time, whereas
+        # forking again here at the top (though not necessary
+        # to illustrate the bug) allows us to give a predictable
+        # timeout to the process of waiting for the children.
+        #
+        # bpo-46210 is present if and only if one or more of the
+        # children forked by main() deadlock when they call print.
+        #
+        # pr-30310 proposes a fix following the example of the
+        # import lock, by providing a function _PySys_ReInitStdio
+        # that is called alongside the other preexisting lock
+        # reinitialization functions in PyOS_AfterFork_Child.
         for stdio in (sys.stdout, sys.stderr):
             with threading_helper.wait_threads_exit():
-                # Forking here is not necessary to illustrate the bug
-                # in bpo-46210 (and its fix). We fork here only to
-                # allow us to give a single timeout to the main() call,
-                # since its 'failure' mode (absent the fix) is to deadlock,
-                # rather than to raise an exception.
                 if main_pid := os.fork():
                     support.wait_process(main_pid, exitcode=0, timeout=5)
                 else:
